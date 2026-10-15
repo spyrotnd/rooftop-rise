@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Rooftop Rise</title>
 <style>:root{padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}body{margin:0}</style>
 </head>
 <body>
-<title>Rooftop Rise</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -411,19 +411,146 @@
   const cleanName = (v) => String(typeof v === "string" ? v : "").replace(/[^\p{L}\p{N} ._'-]/gu, "").trim().slice(0, 14) || "Runner";
   const colorIdx = (v) => (Number.isInteger(v) && v >= 0 && v < RACE_COLORS.length ? v : 0);
   const num = (v) => (Number.isFinite(v) ? v : 0);
-  const cleanCode = (v) => String(v || "").toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 20);
+  const cleanCode = (v) => String(v || "").toLowerCase().replace(/[^a-z0-9-]/g, "").replace(/-+/g, "-").replace(/^-|-$/g, "").slice(0, 20).replace(/-$/, "");
   const newCode = () => "race-" + Math.random().toString(36).slice(2, 6);
   const ord = (n) => n + (["th", "st", "nd", "rd"][(n % 100 - 20) % 10] || ["th", "st", "nd", "rd"][n % 100] || "th");
   const me = { n: cleanName(store.get("rooftop.name", "Runner " + Math.floor(rand(10, 99)))), c: colorIdx(store.get("rooftop.color", 0)), rc: cleanCode(store.get("rooftop.code", "")) || newCode() };
 
+  // ---------- peer-to-peer rooms (used when the game runs outside Claude, e.g. GitHub Pages) ----------
+  // The first player on a race code becomes the host and relays everyone's state; if the host
+  // leaves, the others race to take over. It mirrors the small slice of Claude's room API the game uses.
+  const PEERJS_URL = "https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js";
+  let p2pFailed = false;
+  function loadPeerJS() {
+    return new Promise((res) => {
+      if (window.Peer) return res(window.Peer);
+      const sc = document.createElement("script");
+      sc.src = PEERJS_URL; sc.onload = () => res(window.Peer || (window.peerjs && (window.peerjs.Peer || (window.peerjs.default && window.peerjs.default.Peer))) || null); sc.onerror = () => res(null);
+      document.head.appendChild(sc);
+    });
+  }
+  function createP2PRoom(PeerCtor) {
+    const PREFIX = "rooftop-rise-v1-";
+    let code = null, peer = null, isHost = false, hostConn = null, myId = null, gen = 0;
+    let mine = {}, others = new Map(), snap = Object.freeze([]), online = false;
+    const clients = new Map(); // host only: peerId -> { conn, pr, seen }
+    const subs = new Set(), connSubs = new Set();
+    let notifyQueued = false, sendQueued = false, lastSnapAt = 0, lastSent = 0, dirty = false;
+    const entry = (id, pr, self) => Object.freeze({ peer: id, by: null, isMe: self, sameTab: self, kind: "viewer", guest: false, presence: Object.freeze(pr), updatedAt: Date.now() });
+    function rebuild() {
+      const list = [entry(myId || "me", mine, true)];
+      for (const [id, pr] of others) if (id !== myId) list.push(entry(id, pr, false));
+      snap = Object.freeze(list);
+      if (!notifyQueued) { notifyQueued = true; setTimeout(() => { notifyQueued = false; subs.forEach((f) => { try { f({ peers: snap, joined: [], left: [], updated: [] }); } catch {} }); }, 0); }
+    }
+    function setOnline(v) { if (online !== v) { online = v; connSubs.forEach((f) => { try { f(v); } catch {} }); } }
+    const cleanPr = (pr) => (pr && typeof pr === "object" && !Array.isArray(pr) && JSON.stringify(pr).length < 4096 ? pr : null);
+    function teardown() {
+      try { hostConn && hostConn.close(); } catch {}
+      for (const c of clients.values()) { try { c.conn.close(); } catch {} }
+      clients.clear(); hostConn = null;
+      try { peer && peer.destroy(); } catch {}
+      peer = null; isHost = false; myId = null; others = new Map();
+    }
+    function start(c) { const my = ++gen; teardown(); code = c; setOnline(false); rebuild(); tryHost(my); }
+    function tryHost(my) {
+      const p = new PeerCtor(PREFIX + code, { debug: 0 }); peer = p;
+      p.on("open", (id) => { if (my !== gen) { p.destroy(); return; } isHost = true; myId = id; others = new Map(); dirty = true; setOnline(true); rebuild(); });
+      p.on("connection", (conn) => {
+        if (my !== gen || !isHost) { try { conn.close(); } catch {} return; }
+        conn.on("open", () => { clients.set(conn.peer, { conn, pr: null, seen: Date.now() }); dirty = true; });
+        conn.on("data", (d) => {
+          const c = clients.get(conn.peer); if (!c) return; c.seen = Date.now();
+          if (d && d.t === "p") { const pr = cleanPr(d.pr); if (pr) { c.pr = pr; dirty = true; } }
+        });
+        const drop = () => { if (clients.delete(conn.peer)) dirty = true; };
+        conn.on("close", drop); conn.on("error", drop);
+      });
+      p.on("error", (err) => {
+        if (my !== gen) return;
+        if (err && err.type === "unavailable-id") { try { p.destroy(); } catch {} peer = null; joinAsClient(my); }
+        else if (err && (err.type === "webrtc" || err.type === "peer-unavailable")) { /* one bad link, not the whole room */ }
+        else retry(my, 2500);
+      });
+      p.on("disconnected", () => { if (my === gen && isHost) { try { p.reconnect(); } catch {} } });
+    }
+    function joinAsClient(my) {
+      const p = new PeerCtor(undefined, { debug: 0 }); peer = p; isHost = false;
+      p.on("open", (id) => {
+        if (my !== gen) { p.destroy(); return; }
+        myId = id; rebuild();
+        const conn = p.connect(PREFIX + code, { reliable: true }); hostConn = conn;
+        conn.on("open", () => { if (my !== gen) return; lastSnapAt = Date.now(); setOnline(true); sendMine(true); });
+        conn.on("data", (d) => {
+          if (my !== gen || !d || d.t !== "s" || !Array.isArray(d.ps)) return;
+          lastSnapAt = Date.now();
+          const m = new Map();
+          for (const e of d.ps.slice(0, 32)) if (Array.isArray(e) && typeof e[0] === "string") { const pr = cleanPr(e[1]); if (pr) m.set(e[0], pr); }
+          others = m; rebuild();
+        });
+        conn.on("close", () => { if (my === gen) hostLost(my); });
+      });
+      p.on("error", (err) => { if (my !== gen) return; if (err && err.type === "peer-unavailable") hostLost(my); else retry(my, 2500); });
+    }
+    function hostLost(my) { teardown(); setOnline(false); rebuild(); setTimeout(() => { if (my === gen) tryHost(my); }, 300 + Math.random() * 1500); }
+    function retry(my, ms) { teardown(); setOnline(false); rebuild(); setTimeout(() => { if (my === gen) tryHost(my); }, ms + Math.random() * 1000); }
+    function sendMine(force) {
+      if (isHost || !hostConn || !hostConn.open) return;
+      const now = Date.now();
+      if (!force && now - lastSent < 50) { if (!sendQueued) { sendQueued = true; setTimeout(() => { sendQueued = false; sendMine(true); }, 50); } return; }
+      lastSent = now;
+      try { hostConn.send({ t: "p", pr: mine }); } catch {}
+    }
+    // host: relay everyone's state ~15 times a second; everyone: keepalives and timeouts
+    setInterval(() => {
+      const now = Date.now();
+      if (isHost && peer) {
+        for (const [id, c] of clients) if (now - c.seen > 8000) { try { c.conn.close(); } catch {} clients.delete(id); dirty = true; }
+        if (dirty || now - lastSent > 1000) {
+          dirty = false; lastSent = now;
+          others = new Map([...clients].filter(([, c]) => c.pr).map(([id, c]) => [id, c.pr]));
+          rebuild();
+          const ps = [[myId, mine], ...others];
+          for (const c of clients.values()) { try { c.conn.open && c.conn.send({ t: "s", ps }); } catch {} }
+        }
+      } else if (hostConn && hostConn.open) {
+        if (now - lastSent > 2000) sendMine(true);
+        if (now - lastSnapAt > 8000) hostLost(gen);
+      }
+    }, 66);
+    addEventListener("pagehide", () => teardown());
+    return {
+      p2p: true,
+      switchTo(c) { if (c && c !== code) start(c); },
+      leave() { gen++; teardown(); code = null; setOnline(false); rebuild(); },
+      presence(patch) {
+        mine = Object.assign({}, mine);
+        for (const k in patch) { if (patch[k] === null) delete mine[k]; else mine[k] = patch[k]; }
+        if (isHost) dirty = true; else sendMine(false);
+        rebuild();
+        return Promise.resolve();
+      },
+      peers: () => snap,
+      onPeers(f) { subs.add(f); setTimeout(() => f({ peers: snap, joined: [], left: [], updated: [] }), 0); return () => subs.delete(f); },
+      connected: () => online,
+      onConnection(f) { connSubs.add(f); setTimeout(() => f(online), 0); return () => connSubs.delete(f); },
+    };
+  }
+
   async function connectRoom() {
     if (roomTried) return; roomTried = true;
     try { room = window.claude && typeof window.claude.use === "function" ? await window.claude.use("room") : null; } catch { room = null; }
+    if (!room && !window.claude) {
+      // outside Claude: go peer-to-peer
+      const PeerCtor = await loadPeerJS();
+      if (PeerCtor) { room = createP2PRoom(PeerCtor); if (mode === "race") room.switchTo(me.rc); }
+      else p2pFailed = true;
+    }
     if (room) {
       room.onPeers(onRoomChange, () => { room = null; renderLobby(); });
-      room.onConnection(() => renderLobby(), () => {});
+      room.onConnection(() => { renderLobby(); pushPresence(); }, () => {});
     }
-    renderLobby();
+    renderLobby(); pushPresence();
   }
   function pushPresence(extra) {
     if (!room || mode !== "race") return;
@@ -448,11 +575,14 @@
     reset(); state = "menu"; show("raceCard");
     $("hud").hidden = true; $("standings").hidden = true; $("pads").hidden = true;
     $("raceName").value = me.n; $("raceCode").value = me.rc;
-    renderSwatches(); renderLobby(); connectRoom(); pushPresence();
+    renderSwatches(); renderLobby(); connectRoom();
+    if (room && room.p2p) room.switchTo(me.rc);
+    pushPresence();
   }
   function leaveRace() {
     mode = "solo"; race.st = "lobby"; ghosts.clear();
-    if (room) room.presence({ n: null, c: null, rc: null, st: null, ep: null, h: null, x: null, y: null, f: null, a: null }).catch(() => {});
+    if (room) room.presence({ n: null, c: null, rc: null, st: null, ep: null, h: null, x: null, y: null, f: null, a: null, s: null, hit: null }).catch(() => {});
+    if (room && room.p2p) room.leave();
     reset(); state = "menu"; show("startCard"); $("hud").hidden = true; $("standings").hidden = true;
   }
   function backToLobby() {
@@ -483,7 +613,11 @@
   $("raceCode").addEventListener("change", (e) => setCode(e.target.value));
   $("raceCode").addEventListener("keydown", (e) => { if (e.key === "Enter") setCode(e.target.value); });
   $("newCode").onclick = () => setCode(newCode());
-  function setCode(v) { me.rc = cleanCode(v) || newCode(); $("raceCode").value = me.rc; store.set("rooftop.code", me.rc); pushPresence(); renderLobby(); }
+  function setCode(v) {
+    me.rc = cleanCode(v) || newCode(); $("raceCode").value = me.rc; store.set("rooftop.code", me.rc);
+    if (room && room.p2p) room.switchTo(me.rc);
+    pushPresence(); renderLobby();
+  }
   $("raceBtn").onclick = openRace;
   $("raceBack").onclick = leaveRace;
   $("raceStart").onclick = () => {
@@ -493,10 +627,11 @@
 
   function renderLobby() {
     const status = $("raceStatus");
-    if (!roomTried || (room && !room.connected())) status.textContent = "Connecting to the race lobby…";
+    if (!roomTried || (room && !room.connected())) status.textContent = room && room.p2p ? `Connecting to race "${me.rc}"…` : "Connecting to the race lobby…";
+    else if (!room && p2pFailed) status.textContent = "Couldn't reach the online race service. Check your internet connection, or try a different network. You can still climb solo.";
     else if (!room) status.textContent = "Live racing isn't available here. It works when this game is opened in Claude by signed-in people it's been shared with. You can still climb solo.";
     else status.textContent = "Everyone on the same race code climbs the same tower. Whoever climbs highest wins. Share the code, then press Start when your friends show up below.";
-    $("raceStart").disabled = !room;
+    $("raceStart").disabled = !room || !room.connected();
     renderRoster();
   }
   function renderRoster() {
